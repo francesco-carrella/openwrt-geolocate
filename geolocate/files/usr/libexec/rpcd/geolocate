@@ -1,0 +1,77 @@
+#!/bin/sh
+
+# shellcheck source=/dev/null
+. /usr/share/libubox/jshn.sh
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "info"
+		json_close_object
+		json_add_object "scan"
+		json_close_object
+		json_add_object "output_status"
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			info)
+				# Read position file and compute age
+				if [ -f "/tmp/geolocate/position.json" ]; then
+					# Inject age field (current time - timestamp)
+					lua -e '
+						local json = require "luci.jsonc"
+						local f = io.open("/tmp/geolocate/position.json", "r")
+						if f then
+							local data = json.parse(f:read("*a"))
+							f:close()
+							if data and data.timestamp then
+								data.age = os.time() - data.timestamp
+							end
+							print(json.stringify(data))
+						else
+							print("{}")
+						end
+					'
+				else
+					echo "{}"
+				fi
+				;;
+			scan)
+				# Trigger scan by finding daemon PID and sending signal
+				pid=$(pgrep -f "/usr/bin/geolocate-daemon" | head -1)
+				if [ -n "$pid" ]; then
+					kill -USR1 "$pid" 2>/dev/null
+					json_init
+					json_add_string "status" "triggered"
+					json_add_int "pid" "${pid}"
+				else
+					json_init
+					json_add_string "status" "error"
+					json_add_string "message" "Daemon not running"
+				fi
+				json_dump
+				json_cleanup
+				;;
+			output_status)
+				_dir="/tmp/geolocate/output_status"
+				json_init
+				if [ -d "$_dir" ]; then
+					for _f in "$_dir"/*; do
+						[ -f "$_f" ] || continue
+						_name=$(basename "$_f")
+						read -r _status _ts < "$_f"
+						json_add_object "$_name"
+						json_add_string "status" "$_status"
+						json_add_int "timestamp" "${_ts:-0}"
+						json_close_object
+					done
+				fi
+				json_dump
+				json_cleanup
+				;;
+		esac
+		;;
+esac

@@ -1,0 +1,37 @@
+{
+	"admin/services/geolocate": {
+		"title": "Geolocate",
+		"order": 90,
+		"action": {
+			"type": "alias",
+			"path": "admin/services/geolocate/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-geolocate" ]
+		}
+	},
+	"admin/services/geolocate/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "geolocate/overview"
+		}
+	},
+	"admin/services/geolocate/settings": {
+		"title": "Settings",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "geolocate/settings"
+		}
+	},
+	"admin/services/geolocate/trackers": {
+		"title": "Trackers",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "geolocate/trackers"
+		}
+	}
+}

@@ -1,0 +1,609 @@
+#!/bin/sh
+
+# shellcheck source=/dev/null
+. /lib/functions.sh
+
+POS_FILE="/tmp/geolocate/position.json"
+LOG_FILE="/tmp/geolocate/log.json"
+OUTPUTS_SCRIPT="/usr/lib/geolocate/outputs.sh"
+
+# Log level hierarchy: error=0, warning=1, info=2, debug=3
+LOG_LEVEL_NUM=1
+
+log() {
+    local level="$1"
+    local msg="$2"
+    local level_num=0
+
+    case "$level" in
+        error)   level_num=0 ;;
+        warning) level_num=1 ;;
+        info)    level_num=2 ;;
+        debug)   level_num=3 ;;
+    esac
+
+    [ "$level_num" -le "$LOG_LEVEL_NUM" ] && \
+        logger -t geolocate "[$level] $msg"
+}
+
+load_config() {
+    config_load geolocate
+
+    config_get_bool ENABLED main enabled 1
+    config_get INTERVAL main interval 300
+    # Validate interval: must be numeric and within sane bounds
+    case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300 ;; esac
+    [ "$INTERVAL" -lt 30 ] 2>/dev/null && INTERVAL=30
+    [ "$INTERVAL" -gt 86400 ] 2>/dev/null && INTERVAL=86400
+    config_get LOG_LEVEL main log_level "warning"
+
+    config_get BACKEND_TYPE backend type "beacondb"
+
+    # Read provider-specific credentials
+    BACKEND_KEY=""
+    BACKEND_URL=""
+    case "$BACKEND_TYPE" in
+        google)
+            config_get BACKEND_KEY backend google_api_key ""
+            ;;
+        unwiredlabs)
+            config_get BACKEND_KEY backend unwiredlabs_api_key ""
+            ;;
+        custom)
+            config_get BACKEND_KEY backend custom_api_key ""
+            config_get BACKEND_URL backend custom_url ""
+            ;;
+    esac
+
+    config_get_bool WIFI_ENABLED scanning wifi_enabled 1
+    config_get WIFI_RADIO scanning wifi_radio "wlan0"
+    config_get WIFI_MIN_APS scanning wifi_min_aps 2
+    config_get_bool CELL_ENABLED scanning cell_enabled 1
+    config_get CELL_METHOD scanning cell_method "auto"
+    config_get_bool NOMAP_FILTER scanning nomap_filter 1
+
+    # Set log level number
+    case "$LOG_LEVEL" in
+        error)   LOG_LEVEL_NUM=0 ;;
+        warning) LOG_LEVEL_NUM=1 ;;
+        info)    LOG_LEVEL_NUM=2 ;;
+        debug)   LOG_LEVEL_NUM=3 ;;
+    esac
+}
+
+scan_wifi() {
+    local radio="$1"
+    local scan_data
+
+    # Validate radio interface name (alphanumeric + hyphen only)
+    case "$radio" in *[!a-zA-Z0-9_-]*) log "error" "Invalid radio name: $radio"; echo "[]"; return 0 ;; esac
+
+    scan_data=$(ubus call iwinfo scan "{ \"device\": \"$radio\" }" 2>/dev/null)
+    if [ -z "$scan_data" ]; then
+        log "debug" "WiFi scan returned no data for $radio"
+        echo "[]"
+        return 0
+    fi
+
+    # shellcheck disable=SC2153
+    local nomap_filter="$NOMAP_FILTER"
+
+    # Parse with Lua: extract fields, apply _nomap and randomized BSSID filters
+    echo "$scan_data" | lua -e "
+        local json = require 'luci.jsonc'
+        local input = io.read('*a')
+        local data = json.parse(input)
+        local out = {}
+        local nomap = $nomap_filter
+        if data and data.results then
+            for _, ap in ipairs(data.results) do
+                local dominated = false
+
+                -- Filter _nomap SSIDs
+                if nomap == 1 and ap.ssid and ap.ssid:find('_nomap') then
+                    dominated = true
+                end
+
+                -- Filter locally-administered / randomized BSSIDs
+                if not dominated and ap.bssid then
+                    local second = ap.bssid:sub(2, 2):upper()
+                    if second == '2' or second == '3' or second == '6' or second == '7'
+                    or second == 'A' or second == 'B' or second == 'E' or second == 'F' then
+                        dominated = true
+                    end
+                end
+
+                if not dominated then
+                    table.insert(out, {
+                        macAddress = ap.bssid,
+                        signalStrength = ap.signal,
+                        channel = ap.channel
+                    })
+                end
+            end
+        end
+        print(json.stringify(out))
+    "
+}
+
+scan_cell() {
+    local method="$CELL_METHOD"
+
+    # Auto-detect: gl_modem (GL.iNet) → mmcli (ModemManager)
+    if [ "$method" = "auto" ]; then
+        if command -v gl_modem >/dev/null 2>&1; then
+            method="gl_modem_at"
+        elif command -v mmcli >/dev/null 2>&1; then
+            method="mmcli"
+        else
+            log "debug" "No cell modem command available"
+            echo "[]"
+            return 0
+        fi
+    fi
+
+    case "$method" in
+        gl_modem_at)
+            scan_cell_gl_modem
+            ;;
+        mmcli)
+            scan_cell_mmcli
+            ;;
+        *)
+            log "warning" "Unknown cell method: $method"
+            echo "[]"
+            ;;
+    esac
+}
+
+scan_cell_mmcli() {
+    if ! command -v mmcli >/dev/null 2>&1; then
+        echo "[]"
+        return 0
+    fi
+
+    # Ensure 3GPP location is enabled (idempotent, fast if already on)
+    timeout 5 mmcli -m 0 --location-enable-3gpp 2>/dev/null
+
+    local loc
+    loc=$(timeout 5 mmcli -m 0 --location-get -K 2>/dev/null)
+
+    if [ -z "$loc" ]; then
+        log "debug" "mmcli returned no location data"
+        echo "[]"
+        return 0
+    fi
+
+    # Parse key-value output: mcc/mnc are decimal, tac/cid/lac are hex
+    echo "$loc" | lua -e '
+        local input = io.read("*a")
+        local out = {}
+
+        local function val(key)
+            local escaped = key:gsub("%.", "%%.")
+            return input:match(escaped .. "%s*:%s*(%S+)")
+        end
+
+        local mcc = tonumber(val("modem.location.3gpp.mcc"))
+        local mnc = tonumber(val("modem.location.3gpp.mnc"))
+        local tac_hex = val("modem.location.3gpp.tac")
+        local lac_hex = val("modem.location.3gpp.lac")
+        local cid_hex = val("modem.location.3gpp.cid")
+
+        if not mcc or not mnc then
+            print("[]")
+            return
+        end
+
+        local tac_num = tac_hex and tonumber(tac_hex, 16) or 0
+        local lac_num = lac_hex and tonumber(lac_hex, 16) or 0
+        local cid = cid_hex and tonumber(cid_hex, 16) or 0
+
+        -- TAC non-zero = LTE/5G; TAC zero + LAC non-zero = GSM/UMTS
+        local radioType = "lte"
+        local locationAreaCode = tac_num
+        if tac_num == 0 and lac_num > 0 and lac_num ~= 0xFFFE then
+            radioType = "gsm"
+            locationAreaCode = lac_num
+        end
+
+        local json = require "luci.jsonc"
+        table.insert(out, {
+            mobileCountryCode = mcc,
+            mobileNetworkCode = mnc,
+            locationAreaCode = locationAreaCode,
+            cellId = cid,
+            radioType = radioType
+        })
+        print(json.stringify(out))
+    '
+}
+
+scan_cell_gl_modem() {
+    if ! command -v gl_modem >/dev/null 2>&1; then
+        echo "[]"
+        return 0
+    fi
+
+    # Try LTE first (CEREG), fall back to GSM/UMTS (CREG)
+    timeout 5 gl_modem AT 'AT+CEREG=2' >/dev/null 2>&1
+    local cereg_response
+    cereg_response=$(timeout 5 gl_modem AT 'AT+CEREG?' 2>/dev/null)
+
+    local creg_response=""
+    # If CEREG has no location data, try CREG (GSM/UMTS)
+    if ! echo "$cereg_response" | grep -q '+CEREG:.*".*"'; then
+        timeout 5 gl_modem AT 'AT+CREG=2' >/dev/null 2>&1
+        creg_response=$(timeout 5 gl_modem AT 'AT+CREG?' 2>/dev/null)
+    fi
+
+    # Get COPS for MCC/MNC (set numeric format first)
+    timeout 5 gl_modem AT 'AT+COPS=3,2' >/dev/null 2>&1
+    local cops_response
+    cops_response=$(timeout 5 gl_modem AT 'AT+COPS?' 2>/dev/null)
+
+    printf '%s\n%s\n%s' "$cereg_response" "$creg_response" "$cops_response" | lua -e '
+        local json = require "luci.jsonc"
+        local input = io.read("*a")
+        local out = {}
+
+        -- Parse CEREG: +CEREG: 2,1,"A46E","1294B0D",7
+        local tac, ci, act = input:match("CEREG:%s*%d,%d,\"(%x+)\",\"(%x+)\",(%d+)")
+
+        -- Fall back to CREG: +CREG: 2,1,"4F47","06D7115",2
+        if not tac then
+            tac, ci, act = input:match("CREG:%s*%d,%d,\"(%x+)\",\"(%x+)\",(%d+)")
+            -- CREG without AcT: +CREG: 2,1,"4F47","06D7115"
+            if not tac then
+                tac, ci = input:match("CREG:%s*%d,%d,\"(%x+)\",\"(%x+)\"")
+                if tac then act = "0" end
+            end
+        end
+
+        -- Parse COPS for numeric: +COPS: 0,2,"22210",7
+        local plmn = input:match("COPS:%s*%d,%d,\"(%d+)\"")
+
+        if tac and ci then
+            local mcc, mnc = nil, nil
+            if plmn and #plmn >= 5 then
+                mcc = tonumber(plmn:sub(1, 3))
+                mnc = tonumber(plmn:sub(4))
+            end
+
+            -- 3GPP TS 27.007 AcT values
+            local radioType = "lte"
+            if act then
+                local a = tonumber(act)
+                if a == 0 or a == 1 or a == 3 then radioType = "gsm"
+                elseif a == 2 or a == 4 or a == 5 or a == 6 then radioType = "wcdma"
+                elseif a == 7 or a == 9 or a == 10 or a == 11 or a == 13 then radioType = "lte"
+                end
+            end
+
+            table.insert(out, {
+                mobileCountryCode = mcc,
+                mobileNetworkCode = mnc,
+                locationAreaCode = tonumber(tac, 16),
+                cellId = tonumber(ci, 16),
+                radioType = radioType
+            })
+        end
+        print(json.stringify(out))
+    '
+}
+
+query_beacondb() {
+    local wifi_json="$1"
+    local cell_json="$2"
+
+    local body="{\"wifiAccessPoints\": $wifi_json, \"cellTowers\": $cell_json}"
+
+    log "debug" "Sending to BeaconDB (wifi+cell data)"
+
+    curl -s --max-time 15 -X POST "https://api.beacondb.net/v1/geolocate" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+}
+
+query_google() {
+    local wifi_json="$1"
+    local cell_json="$2"
+    local api_key="$3"
+
+    local body="{\"wifiAccessPoints\": $wifi_json, \"cellTowers\": $cell_json}"
+
+    log "debug" "Sending to Google Geolocation API"
+
+    curl -s --max-time 15 -X POST \
+        "https://www.googleapis.com/geolocation/v1/geolocate?key=${api_key}" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+}
+
+query_unwiredlabs() {
+    local wifi_json="$1"
+    local cell_json="$2"
+    local api_key="$3"
+
+    # Transform wifi data to Unwired Labs field names
+    local wifi_ul
+    wifi_ul=$(echo "$wifi_json" | lua -e '
+        local json = require "luci.jsonc"
+        local input = io.read("*a")
+        local data = json.parse(input)
+        local out = {}
+        if data then
+            for _, ap in ipairs(data) do
+                table.insert(out, {
+                    bssid = ap.macAddress,
+                    signal = ap.signalStrength,
+                    channel = ap.channel
+                })
+            end
+        end
+        print(json.stringify(out))
+    ')
+
+    # Transform cell data to Unwired Labs field names
+    local cell_ul
+    cell_ul=$(echo "$cell_json" | lua -e '
+        local json = require "luci.jsonc"
+        local input = io.read("*a")
+        local data = json.parse(input)
+        local out = {}
+        if data then
+            for _, tower in ipairs(data) do
+                table.insert(out, {
+                    mcc = tower.mobileCountryCode,
+                    mnc = tower.mobileNetworkCode,
+                    lac = tower.locationAreaCode,
+                    cid = tower.cellId,
+                    radio = tower.radioType
+                })
+            end
+        end
+        print(json.stringify(out))
+    ')
+
+    local body="{\"token\": \"$api_key\", \"wifi\": $wifi_ul, \"cells\": $cell_ul}"
+
+    log "debug" "Sending to Unwired Labs"
+
+    local response
+    response=$(curl -s --max-time 15 -X POST "https://us1.unwiredlabs.com/v2/process" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    # Transform response to match standard MLS format
+    echo "$response" | lua -e '
+        local json = require "luci.jsonc"
+        local input = io.read("*a")
+        local data = json.parse(input)
+        local out = {}
+        if data and data.status == "ok" then
+            out.location = { lat = data.lat, lng = data.lon }
+            out.accuracy = data.accuracy
+        elseif data then
+            out.error = data.message or "Unknown error"
+            out.fallback = "error"
+        end
+        print(json.stringify(out))
+    '
+}
+
+query_custom() {
+    local wifi_json="$1"
+    local cell_json="$2"
+    local url="$3"
+    local api_key="$4"
+
+    local body="{\"wifiAccessPoints\": $wifi_json, \"cellTowers\": $cell_json}"
+
+    log "debug" "Sending to custom endpoint"
+
+    local sep="?"
+    case "$url" in *"?"*) sep="&" ;; esac
+    local full_url="$url"
+    [ -n "$api_key" ] && full_url="${url}${sep}key=${api_key}"
+
+    curl -s --max-time 15 -X POST "$full_url" \
+        -H "Content-Type: application/json" \
+        -d "$body"
+}
+
+# Normalize API response to flat position format
+
+# Input: raw API JSON response + metadata
+# Output: flat JSON written to POS_FILE
+update_position_file() {
+    local json="$1"
+    local wifi_count="${2:-0}"
+    local cell_count="${3:-0}"
+    local backend="$4"
+
+    # Validate: must have location.lat
+    local lat
+    lat=$(echo "$json" | jsonfilter -e '@.location.lat' 2>/dev/null)
+
+    if [ -n "$lat" ]; then
+        # Normalize to flat PRD format
+        local enriched
+        enriched=$(echo "$json" | lua -e "
+            local json = require 'luci.jsonc'
+            local input = io.read('*a')
+            local data = json.parse(input)
+            if data then
+                local out = {}
+                -- Flatten location
+                if data.location then
+                    out.latitude = data.location.lat
+                    out.longitude = data.location.lng
+                end
+                out.accuracy = data.accuracy
+                out.wifi_aps = $wifi_count
+                out.cell_towers = $cell_count
+                out.timestamp = os.time()
+                out.backend = '$backend'
+
+                -- Determine source
+                if data.fallback == 'ipf' then
+                    out.source = 'ip'
+                elseif $wifi_count > 0 and $cell_count > 0 then
+                    out.source = 'wifi+cell'
+                elseif $wifi_count > 0 then
+                    out.source = 'wifi'
+                elseif $cell_count > 0 then
+                    out.source = 'cell'
+                else
+                    out.source = 'unknown'
+                end
+
+                print(json.stringify(out))
+            end
+        ")
+        if [ -z "$enriched" ]; then
+            log "warning" "Position enrichment produced empty output, keeping previous position"
+            return
+        fi
+        echo "$enriched" > "${POS_FILE}.tmp" && mv "${POS_FILE}.tmp" "$POS_FILE"
+        log "info" "Position updated: $lat (source: $backend, wifi: $wifi_count, cell: $cell_count)"
+
+        # Append to log ring buffer (last 10 entries)
+        append_log "$enriched"
+    else
+        log "warning" "Backend returned no position: $json"
+    fi
+}
+
+# Append entry to log.json ring buffer (max 10 entries)
+append_log() {
+    local entry="$1"
+    local max_entries=10
+
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "[$entry]" > "$LOG_FILE"
+        return
+    fi
+
+    # Use Lua to append and trim to max entries
+    lua -e "
+        local json = require 'luci.jsonc'
+
+        local f = io.open('$LOG_FILE', 'r')
+        local content = f and f:read('*a') or '[]'
+        if f then f:close() end
+
+        local log = json.parse(content) or {}
+        local entry = json.parse([=[$entry]=])
+        if entry then
+            table.insert(log, entry)
+            -- Trim to last $max_entries
+            while #log > $max_entries do
+                table.remove(log, 1)
+            end
+        end
+
+        local f = io.open('$LOG_FILE', 'w')
+        f:write(json.stringify(log))
+        f:close()
+    "
+}
+
+main_loop() {
+    # Trap SIGUSR1 to force immediate scan (by interrupting sleep)
+    trap 'true' USR1
+
+    # Source outputs dispatcher once at startup
+    if [ -f "$OUTPUTS_SCRIPT" ]; then
+        . "$OUTPUTS_SCRIPT"
+    fi
+
+    while [ "$ENABLED" -eq 1 ]; do
+        # Scan WiFi (if enabled)
+        local wifi_data="[]"
+        if [ "$WIFI_ENABLED" -eq 1 ]; then
+            wifi_data=$(scan_wifi "$WIFI_RADIO")
+            [ -z "$wifi_data" ] && wifi_data="[]"
+        fi
+
+        # Scan cell (if enabled)
+        local cell_data="[]"
+        if [ "$CELL_ENABLED" -eq 1 ]; then
+            cell_data=$(scan_cell)
+            [ -z "$cell_data" ] && cell_data="[]"
+        fi
+
+        # Count APs and towers
+        local wifi_count=0 cell_count=0
+        if [ "$wifi_data" != "[]" ]; then
+            wifi_count=$(echo "$wifi_data" | lua -e 'local json=require"luci.jsonc"; local d=json.parse(io.read("*a")); print(d and #d or 0)')
+        fi
+        if [ "$cell_data" != "[]" ]; then
+            cell_count=$(echo "$cell_data" | lua -e 'local json=require"luci.jsonc"; local d=json.parse(io.read("*a")); print(d and #d or 0)')
+        fi
+
+        # Check minimum AP threshold
+        if [ "$wifi_count" -lt "$WIFI_MIN_APS" ] && [ "$cell_count" -eq 0 ]; then
+            log "debug" "Below minimum: ${wifi_count} APs (need ${WIFI_MIN_APS}), 0 towers. Skipping query."
+        elif [ "$wifi_count" -eq 0 ] && [ "$cell_count" -eq 0 ]; then
+            log "debug" "No WiFi APs or cell towers found. Skipping query."
+        else
+            # If WiFi below threshold but we have cell, send cell-only
+            if [ "$wifi_count" -lt "$WIFI_MIN_APS" ]; then
+                log "info" "WiFi APs below threshold (${wifi_count}/${WIFI_MIN_APS}), using cell-only query"
+                wifi_data="[]"
+                wifi_count=0
+            fi
+
+            local result
+            case "$BACKEND_TYPE" in
+                beacondb)
+                    result=$(query_beacondb "$wifi_data" "$cell_data")
+                    ;;
+                google)
+                    result=$(query_google "$wifi_data" "$cell_data" "$BACKEND_KEY")
+                    ;;
+                unwiredlabs)
+                    result=$(query_unwiredlabs "$wifi_data" "$cell_data" "$BACKEND_KEY")
+                    ;;
+                custom)
+                    result=$(query_custom "$wifi_data" "$cell_data" "$BACKEND_URL" "$BACKEND_KEY")
+                    ;;
+                *)
+                    log "error" "Unknown backend type: $BACKEND_TYPE"
+                    ;;
+            esac
+
+            if [ -n "$result" ]; then
+                update_position_file "$result" "$wifi_count" "$cell_count" "$BACKEND_TYPE"
+
+                # Dispatch to configured outputs
+                if type forward_outputs >/dev/null 2>&1; then
+                    forward_outputs "$POS_FILE"
+                fi
+            fi
+        fi
+
+        # Sleep in background to allow SIGUSR1 interruption
+        sleep "$INTERVAL" &
+        wait $!
+
+        # Reap any remaining output subshells before reloading config
+        wait 2>/dev/null
+
+        # Reload config in case it changed
+        load_config
+    done
+}
+
+# Initial config load
+load_config
+
+# Create tmp dirs
+umask 077
+mkdir -p /tmp/geolocate
+mkdir -p /tmp/geolocate/output_status
+
+log "info" "geolocate-daemon starting (backend=$BACKEND_TYPE, interval=${INTERVAL}s)"
+
+main_loop

@@ -1,0 +1,18 @@
+{
+  "luci-app-geolocate": {
+    "description": "Grant access to geolocate configuration",
+    "read": {
+      "ubus": {
+        "geolocate": ["info", "scan", "output_status"],
+        "iwinfo": ["scan"]
+      },
+      "uci": ["geolocate"],
+      "file": {
+        "/tmp/geolocate/position.json": ["read"]
+      }
+    },
+    "write": {
+      "uci": ["geolocate"]
+    }
+  }
+}

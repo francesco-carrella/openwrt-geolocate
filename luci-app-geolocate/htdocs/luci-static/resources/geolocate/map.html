@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="leaflet/leaflet.css">
+<style>
+html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="leaflet/leaflet.js"></script>
+<script>
+'use strict';
+
+var map, marker, circle;
+var lastLat = null, lastLon = null;
+var userMoved = false;
+
+function initMap() {
+	map = L.map('map').setView([0, 0], 2);
+	L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+		attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+	}).addTo(map);
+
+	var zoomBar = map.zoomControl.getContainer();
+	var centerLink = document.createElement('a');
+	centerLink.href = '#';
+	centerLink.title = 'Re-center';
+	centerLink.setAttribute('role', 'button');
+	centerLink.setAttribute('aria-label', 'Re-center map');
+	centerLink.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" style="vertical-align:middle">'
+		+ '<circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2.5"/>'
+		+ '<line x1="12" y1="1" x2="12" y2="7" stroke="currentColor" stroke-width="2.5"/>'
+		+ '<line x1="12" y1="17" x2="12" y2="23" stroke="currentColor" stroke-width="2.5"/>'
+		+ '<line x1="1" y1="12" x2="7" y2="12" stroke="currentColor" stroke-width="2.5"/>'
+		+ '<line x1="17" y1="12" x2="23" y2="12" stroke="currentColor" stroke-width="2.5"/>'
+		+ '</svg>';
+	zoomBar.appendChild(centerLink);
+	L.DomEvent.on(centerLink, 'click', function(e) {
+		L.DomEvent.preventDefault(e);
+		handleCenter();
+	});
+
+	map.on('dragstart zoomstart', function() {
+		userMoved = true;
+	});
+
+	window.addEventListener('message', function(ev) {
+		if (ev.data && ev.data.type === 'updatePosition')
+			updatePosition(ev.data);
+	});
+
+	window.parent.postMessage({ type: 'mapReady' }, '*');
+}
+
+function updatePosition(data) {
+	var lat = parseFloat(data.latitude);
+	var lon = parseFloat(data.longitude);
+	var acc = parseFloat(data.accuracy);
+	var isUnreliable = (data.source === 'ip');
+
+	if (isNaN(lat) || isNaN(lon))
+		return;
+
+	document.getElementById('map').style.opacity = isUnreliable ? '0.7' : '1';
+
+	var posChanged = (lastLat === null ||
+		lat.toFixed(5) !== lastLat.toFixed(5) ||
+		lon.toFixed(5) !== lastLon.toFixed(5));
+
+	var circleStyle = {
+		color: isUnreliable ? '#999' : '#4285f4',
+		fillColor: isUnreliable ? '#999' : '#4285f4',
+		fillOpacity: isUnreliable ? 0.08 : 0.15,
+		weight: 1
+	};
+
+	if (marker) {
+		marker.setLatLng([lat, lon]);
+		marker.setOpacity(isUnreliable ? 0.5 : 1);
+	} else {
+		marker = L.marker([lat, lon], {
+			opacity: isUnreliable ? 0.5 : 1
+		}).addTo(map);
+	}
+
+	if (!isNaN(acc) && acc > 0 && acc < 50000) {
+		if (circle) {
+			circle.setLatLng([lat, lon]);
+			circle.setRadius(acc);
+			circle.setStyle(circleStyle);
+		} else {
+			circleStyle.radius = acc;
+			circle = L.circle([lat, lon], circleStyle).addTo(map);
+		}
+	} else if (circle) {
+		map.removeLayer(circle);
+		circle = null;
+	}
+
+	if (posChanged && !userMoved) {
+		if (!isNaN(acc) && acc > 0 && acc < 50000 && !isUnreliable)
+			map.fitBounds(circle.getBounds());
+		else
+			map.setView([lat, lon], isUnreliable ? 10 : 15);
+	}
+
+	if (posChanged) {
+		lastLat = lat;
+		lastLon = lon;
+		userMoved = false;
+	}
+}
+
+function handleCenter() {
+	if (lastLat !== null) {
+		userMoved = false;
+		if (circle)
+			map.fitBounds(circle.getBounds());
+		else
+			map.setView([lastLat, lastLon], 15);
+	}
+}
+
+initMap();
+</script>
+</body>
+</html>

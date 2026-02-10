@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  lint:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        run: |
+          shellcheck -s dash \
+            geolocate/files/usr/bin/geolocate-daemon \
+            geolocate/files/etc/init.d/geolocate \
+            geolocate/files/etc/uci-defaults/99-geolocate \
+            geolocate/files/usr/libexec/rpcd/geolocate \
+            geolocate/files/usr/lib/geolocate/outputs.sh \
+            geolocate/files/usr/lib/geolocate/output/*.sh \
+            scripts/*.sh
+
+  release:
+    name: Build and publish
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build IPK packages
+        run: scripts/build-ipk.sh
+
+      - name: Verify IPK structure
+        run: |
+          for ipk in build/*.ipk; do
+            echo "=== $(basename "$ipk") ==="
+            tar tzf "$ipk"
+            tar tzf "$ipk" | grep -q debian-binary
+            tar tzf "$ipk" | grep -q control.tar.gz
+            tar tzf "$ipk" | grep -q data.tar.gz
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.ipk
+          generate_release_notes: true

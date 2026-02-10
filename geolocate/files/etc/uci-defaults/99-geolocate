@@ -1,0 +1,52 @@
+#!/bin/sh
+
+uci -q get geolocate.main > /dev/null || {
+    touch /etc/config/geolocate
+
+    uci batch <<EOF
+set geolocate.main=geolocate
+set geolocate.main.enabled=1
+set geolocate.main.interval=300
+set geolocate.main.log_level=warning
+
+set geolocate.backend=backend
+set geolocate.backend.type=beacondb
+set geolocate.backend.google_api_key=
+set geolocate.backend.unwiredlabs_api_key=
+set geolocate.backend.custom_api_key=
+set geolocate.backend.custom_url=
+
+set geolocate.scanning=scanning
+set geolocate.scanning.wifi_enabled=1
+set geolocate.scanning.wifi_radio=wlan0
+set geolocate.scanning.wifi_min_aps=2
+set geolocate.scanning.cell_enabled=1
+set geolocate.scanning.cell_method=auto
+set geolocate.scanning.nomap_filter=1
+
+set geolocate.output_traccar=output
+set geolocate.output_traccar.type=traccar
+set geolocate.output_traccar.enabled=0
+
+set geolocate.output_owntracks=output
+set geolocate.output_owntracks.type=owntracks
+set geolocate.output_owntracks.enabled=0
+
+set geolocate.output_ha=output
+set geolocate.output_ha.type=homeassistant
+set geolocate.output_ha.enabled=0
+
+set geolocate.output_dawarich=output
+set geolocate.output_dawarich.type=dawarich
+set geolocate.output_dawarich.enabled=0
+
+set geolocate.output_webhook=output
+set geolocate.output_webhook.type=webhook
+set geolocate.output_webhook.enabled=0
+set geolocate.output_webhook.method=POST
+
+commit geolocate
+EOF
+}
+
+exit 0

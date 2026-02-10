@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        run: |
+          shellcheck -s dash \
+            geolocate/files/usr/bin/geolocate-daemon \
+            geolocate/files/etc/init.d/geolocate \
+            geolocate/files/etc/uci-defaults/99-geolocate \
+            geolocate/files/usr/libexec/rpcd/geolocate \
+            geolocate/files/usr/lib/geolocate/outputs.sh \
+            geolocate/files/usr/lib/geolocate/output/*.sh \
+            scripts/*.sh
+
+  build:
+    name: Build IPK packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build packages
+        run: scripts/build-ipk.sh
+
+      - name: Verify IPK structure
+        run: |
+          for ipk in build/*.ipk; do
+            echo "=== $(basename "$ipk") ==="
+            tar tzf "$ipk"
+            tar tzf "$ipk" | grep -q debian-binary
+            tar tzf "$ipk" | grep -q control.tar.gz
+            tar tzf "$ipk" | grep -q data.tar.gz
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-packages
+          path: build/*.ipk
