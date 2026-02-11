@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   lint:
@@ -50,3 +52,40 @@ jobs:
         with:
           files: build/*.ipk
           generate_release_notes: true
+
+      - name: Upload IPK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-packages
+          path: build/*.ipk
+
+  deploy-feed:
+    name: Deploy opkg feed
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download IPK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ipk-packages
+          path: build/
+
+      - name: Build feed
+        run: scripts/build-feed.sh
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/feed/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
